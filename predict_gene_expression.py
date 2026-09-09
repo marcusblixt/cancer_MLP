@@ -17,6 +17,31 @@ from model import MLP, TwoHeadMLP
 EXPRESSION_PATH = "Expression_(Short-read)_Public_26Q1_subsetted.csv"
 MUTATION_PATH = "Damaging_Mutations_(Public_26Q1)_subsetted.csv"
 SUBTYPE_PATH = "Subtype_Matrix_Public_26Q1_subsetted.csv"
+CN_PATH = "Copy_Number_WGS_Public_26Q1_(log2)_subsetted.csv"
+
+INPUT_BLOCKS = ("mutation", "subtype", "cn")  # fixed order - also the column order load_dataset() builds X in
+
+
+def parse_input_source(input_source):
+    """input_source selects any combination of INPUT_BLOCKS: a comma-
+    separated list (e.g. "mutation,cn"), a single block name for an
+    ablation (e.g. "subtype"), "all" for every block, or "both" (legacy
+    alias for "mutation,subtype", kept so older saved configs/notebooks
+    that predate the "cn" block still work). Returns the requested blocks
+    in INPUT_BLOCKS order regardless of the order given, so callers (e.g.
+    TwoHeadMLP's suffix-based branch split) can rely on a fixed column order.
+    """
+    if input_source == "all":
+        tokens = set(INPUT_BLOCKS)
+    elif input_source == "both":
+        tokens = {"mutation", "subtype"}
+    else:
+        tokens = {t.strip() for t in input_source.split(",") if t.strip()}
+    if not tokens or not tokens.issubset(INPUT_BLOCKS):
+        raise ValueError(
+            f"input_source must be 'all', 'both', or a comma-separated combination of {INPUT_BLOCKS}, got {input_source!r}"
+        )
+    return tuple(b for b in INPUT_BLOCKS if b in tokens)
 
 
 def r2_per_gene(y_true, y_pred, min_variance=1e-8):
@@ -106,12 +131,15 @@ def select_mutation_genes_univariate(
 
 def load_dataset(
     n_mutation_genes, n_target_genes, input_source="both",
-    mutation_selection="frequency", min_mutation_count=10, mutation_score_agg="mean", val_split=0.2, seed=0,
+    mutation_selection="frequency", min_mutation_count=10, mutation_score_agg="mean",
+    n_cn_genes=0, val_split=0.2, seed=0,
 ):
-    """input_source: "both" (mutation + subtype, default), "mutation", or
-    "subtype" - restricting to one block is useful for ablations, e.g.
-    checking how much of the model's performance comes from subtype flags
-    alone vs. genuine mutation->expression signal.
+    """input_source: which input block(s) to use - see parse_input_source()
+    for the accepted formats (any comma-separated combination of "mutation",
+    "subtype", "cn"; "all"; or "both" as a legacy alias for
+    "mutation,subtype"). Restricting to fewer blocks is useful for
+    ablations, e.g. checking how much of the model's performance comes from
+    subtype flags alone vs. genuine mutation->expression signal.
 
     mutation_selection: "frequency" (default - most frequently mutated genes,
     independent of the targets) or "univariate" (select genes whose mutation
@@ -119,9 +147,16 @@ def load_dataset(
     select_mutation_genes_univariate, including what mutation_score_agg
     does). val_split/seed are only used to carve out the same training rows
     main() will train on, so the univariate score never sees validation data.
+
+    n_cn_genes caps the CN block to its top-n_cn_genes most-variable genes
+    (0 = all ~18,600), only relevant when "cn" is part of input_source. The
+    CN file is lazily loaded (it alone is ~250MB) and only pulled into the
+    sample intersection when actually requested, because CN (WGS-based)
+    covers far fewer cell lines than the other data sources - requiring it
+    unconditionally would silently drop ~1/3 of samples for every run, even
+    ones not using CN at all.
     """
-    if input_source not in ("both", "mutation", "subtype"):
-        raise ValueError(f"input_source must be 'both', 'mutation', or 'subtype', got {input_source!r}")
+    blocks = parse_input_source(input_source)
     if mutation_selection not in ("frequency", "univariate"):
         raise ValueError(f"mutation_selection must be 'frequency' or 'univariate', got {mutation_selection!r}")
 
@@ -130,6 +165,11 @@ def load_dataset(
     expression_data = pd.read_csv(EXPRESSION_PATH, index_col=0)
 
     common_index = mutation_data.index.intersection(subtype_data.index).intersection(expression_data.index)
+    if "cn" in blocks:
+        cn_data = pd.read_csv(CN_PATH, index_col=0)
+        common_index = common_index.intersection(cn_data.index)
+        cn_data = cn_data.loc[common_index]
+
     mutation_data = mutation_data.loc[common_index]
     subtype_data = subtype_data.loc[common_index]
     expression_data = expression_data.loc[common_index]
@@ -147,7 +187,7 @@ def load_dataset(
     # idea as predict_mutations.py, just used as an input block here) plus
     # every subtype-matrix flag - the subtype matrix is compact enough to use
     # as-is. Skipped entirely when mutation data isn't part of the input.
-    if input_source in ("both", "mutation") and (n_mutation_genes or min_mutation_count > 0):
+    if "mutation" in blocks and (n_mutation_genes or min_mutation_count > 0):
         # Computed once and reused below for both the floor and, in
         # "frequency" mode, the ranking itself (sum and mean of the same
         # boolean matrix rank genes identically, so there's no need to
@@ -183,18 +223,28 @@ def load_dataset(
                 min_mutation_count=min_mutation_count, score_agg=mutation_score_agg,
             )
         mutation_data = mutation_data[selected_mutated]
-    subtype_data = subtype_data.loc[:, subtype_data.var(axis=0) > 0]
 
-    # Mutation gene columns and subtype-flag columns can collide (e.g. both
-    # can have a "KRAS" column with a different meaning) - suffix to keep
-    # them distinct once concatenated.
-    if input_source == "both":
-        X = pd.concat([mutation_data.add_suffix("_mut"), subtype_data.add_suffix("_subtype")], axis=1)
-    elif input_source == "mutation":
-        X = mutation_data.add_suffix("_mut")
-    else:
-        X = subtype_data.add_suffix("_subtype")
+    # Column names can collide across blocks (e.g. mutation and CN can both
+    # have a "KRAS" column with a different meaning) - suffix to keep them
+    # distinct once concatenated. Built in INPUT_BLOCKS order regardless of
+    # how input_source listed them (parse_input_source already sorted it).
+    block_data = []
+    if "mutation" in blocks:
+        block_data.append(mutation_data.add_suffix("_mut"))
+    if "subtype" in blocks:
+        subtype_data = subtype_data.loc[:, subtype_data.var(axis=0) > 0]
+        block_data.append(subtype_data.add_suffix("_subtype"))
+    if "cn" in blocks:
+        # Same "most-variable-first" selection already used for target
+        # genes - CN is continuous like expression, so variance is a
+        # reasonable unsupervised relevance proxy here too (no per-gene
+        # "how often mutated" equivalent to rank by instead).
+        cn_data = cn_data.loc[:, cn_data.var(axis=0) > 0]
+        cn_variance = cn_data.var(axis=0).sort_values(ascending=False)
+        cn_genes = cn_variance.head(n_cn_genes).index if n_cn_genes else cn_variance.index
+        block_data.append(cn_data[cn_genes].add_suffix("_cn"))
 
+    X = pd.concat(block_data, axis=1)
     return X.values.astype(np.float32), expression_data.values.astype(np.float32), list(X.columns), list(target_genes)
 
 
@@ -319,6 +369,7 @@ def main(
     mutation_selection="frequency",
     min_mutation_count=10,
     mutation_score_agg="mean",
+    n_cn_genes=0,
     architecture="single",
     hidden_dims=(512, 256),
     hidden_dims_mutation=(512, 256),
@@ -351,14 +402,19 @@ def main(
     # here, rather than chasing every downstream symptom individually.
     n_mutation_genes, n_target_genes, min_mutation_count = int(n_mutation_genes), int(n_target_genes), int(min_mutation_count)
     patience, pretrain_epochs, pretrain_patience = int(patience), int(pretrain_epochs), int(pretrain_patience)
-    batch_size, epochs, seed = int(batch_size), int(epochs), int(seed)
+    batch_size, epochs, seed, n_cn_genes = int(batch_size), int(epochs), int(seed), int(n_cn_genes)
     dropout, weight_decay, l1_mutation = float(dropout), float(weight_decay), float(l1_mutation)
     val_split, lr = float(val_split), float(lr)
 
     if architecture not in ("single", "two_head"):
         raise ValueError(f"architecture must be 'single' or 'two_head', got {architecture!r}")
-    if architecture == "two_head" and input_source != "both":
-        raise ValueError("architecture='two_head' needs both input blocks - set input_source='both'")
+    input_blocks = parse_input_source(input_source)
+    if architecture == "two_head" and input_blocks != ("mutation", "subtype"):
+        raise ValueError(
+            f"architecture='two_head' needs exactly mutation+subtype, got input_source={input_source!r} "
+            f"(-> {input_blocks}) - set input_source='both' (or 'mutation,subtype'). TwoHeadMLP has exactly 2 "
+            "branches, so a 'cn' block or a single-block ablation isn't supported with it yet."
+        )
     if pretrain_subtype and architecture != "two_head":
         raise ValueError("pretrain_subtype needs architecture='two_head'")
     if l1_mutation and architecture != "two_head":
@@ -377,13 +433,18 @@ def main(
     X, Y, input_features, target_genes = load_dataset(
         n_mutation_genes, n_target_genes, input_source=input_source,
         mutation_selection=mutation_selection, min_mutation_count=min_mutation_count,
-        mutation_score_agg=mutation_score_agg, val_split=val_split, seed=seed,
+        mutation_score_agg=mutation_score_agg, n_cn_genes=n_cn_genes,
+        val_split=val_split, seed=seed,
     )
-    print(f"{X.shape[0]} samples, {X.shape[1]} input features ({input_source}, {mutation_selection}/{mutation_score_agg}), {Y.shape[1]} target genes")
+    print(
+        f"{X.shape[0]} samples, {X.shape[1]} input features "
+        f"({','.join(input_blocks)}, {mutation_selection}/{mutation_score_agg}), {Y.shape[1]} target genes"
+    )
 
     config = dict(
         n_mutation_genes=n_mutation_genes, n_target_genes=n_target_genes, input_source=input_source,
         mutation_selection=mutation_selection, min_mutation_count=min_mutation_count, mutation_score_agg=mutation_score_agg,
+        n_cn_genes=n_cn_genes,
         architecture=architecture, hidden_dims=list(hidden_dims),
         hidden_dims_mutation=list(hidden_dims_mutation), hidden_dims_subtype=list(hidden_dims_subtype),
         dropout=dropout, weight_decay=weight_decay, patience=patience,
@@ -535,8 +596,11 @@ def parse_args():
     parser.add_argument("--n-mutation-genes", type=int, default=10000, help="0 to use all mutated genes")
     parser.add_argument("--n-target-genes", type=int, default=4000, help="most variable expression genes to predict; 0 to use all")
     parser.add_argument(
-        "--input-source", type=str, default="both", choices=["both", "mutation", "subtype"],
-        help="which input block(s) to use - restrict to one for an ablation",
+        "--input-source", type=str, default="both",
+        help="which input block(s) to use: a comma-separated combination of 'mutation', 'subtype', 'cn' "
+        "(e.g. 'mutation,cn'), a single block name for an ablation (e.g. 'subtype'), 'all' for every block, "
+        "or 'both' (legacy alias for 'mutation,subtype'). architecture='two_head' requires exactly "
+        "mutation+subtype (TwoHeadMLP has exactly 2 branches) - CN and single-block ablations need architecture='single'.",
     )
     parser.add_argument(
         "--mutation-selection", type=str, default="frequency", choices=["frequency", "univariate"],
@@ -552,6 +616,10 @@ def parse_args():
         help="univariate selection only: 'mean' R² across targets favors broad-but-weak mutation genes; "
         "'max' favors genes with a strong effect on at least one target, even if narrow. Only changes anything "
         "when --n-mutation-genes is below the number of genes passing --min-mutation-count.",
+    )
+    parser.add_argument(
+        "--n-cn-genes", type=int, default=4000,
+        help="most variable CN genes to include when 'cn' is part of --input-source; 0 to use all ~18,600",
     )
     parser.add_argument(
         "--architecture", type=str, default="single", choices=["single", "two_head"],
@@ -597,6 +665,7 @@ if __name__ == "__main__":
         mutation_selection=args.mutation_selection,
         min_mutation_count=args.min_mutation_count,
         mutation_score_agg=args.mutation_score_agg,
+        n_cn_genes=args.n_cn_genes,
         architecture=args.architecture,
         hidden_dims=args.hidden_dims,
         hidden_dims_mutation=args.hidden_dims_mutation,
