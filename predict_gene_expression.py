@@ -64,6 +64,12 @@ def select_mutation_genes_univariate(
     samples first - correlations from a handful of carriers are dominated by
     noise (same reasoning as the min_variance guard in r2_per_gene) and would
     otherwise crowd out genuinely informative genes at the top of the ranking.
+    Callers can shrink mutation_data to a pre-filtered set of columns first
+    (e.g. genes passing min_mutation_count on the *full* dataset - a
+    necessary but not sufficient condition for passing it on the training
+    split alone, since train_idx is a subset of samples) to cut the cost of
+    this recheck; it's still redone here because passing the full-dataset
+    floor doesn't guarantee passing the stricter training-split-only one.
     """
     if score_agg not in ("mean", "max"):
         raise ValueError(f"score_agg must be 'mean' or 'max', got {score_agg!r}")
@@ -73,6 +79,16 @@ def select_mutation_genes_univariate(
     candidates = mutation_train.columns[candidate_mask]
     if len(candidates) == 0:
         raise ValueError(f"No mutation genes have >= {min_mutation_count} mutated samples in the training split.")
+
+    # Every remaining candidate will be used regardless of score - skip the
+    # (expensive, O(candidates x targets)) correlation computation entirely.
+    if not n_mutation_genes or n_mutation_genes >= len(candidates):
+        if n_mutation_genes:
+            print(
+                f"Only {len(candidates)} mutation genes pass min_mutation_count={min_mutation_count} "
+                f"in the training split (requested {n_mutation_genes}); using all of them."
+            )
+        return candidates
 
     Xc = mutation_train[candidates].values.astype(np.float64)
     Yc = expression_data.iloc[train_idx].values.astype(np.float64)
@@ -85,15 +101,7 @@ def select_mutation_genes_univariate(
     r2 = corr ** 2
     score = r2.mean(axis=1) if score_agg == "mean" else r2.max(axis=1)
 
-    ranked = candidates[np.argsort(-score)]
-    if n_mutation_genes and n_mutation_genes < len(ranked):
-        return ranked[:n_mutation_genes]
-    if n_mutation_genes and n_mutation_genes > len(ranked):
-        print(
-            f"Only {len(ranked)} mutation genes pass min_mutation_count={min_mutation_count} "
-            f"(requested {n_mutation_genes}); using all of them."
-        )
-    return ranked
+    return candidates[np.argsort(-score)][:n_mutation_genes]
 
 
 def load_dataset(
@@ -139,24 +147,36 @@ def load_dataset(
     # idea as predict_mutations.py, just used as an input block here) plus
     # every subtype-matrix flag - the subtype matrix is compact enough to use
     # as-is. Skipped entirely when mutation data isn't part of the input.
+    if input_source in ("both", "mutation") and (n_mutation_genes or min_mutation_count > 0):
+        # Computed once and reused below for both the floor and, in
+        # "frequency" mode, the ranking itself (sum and mean of the same
+        # boolean matrix rank genes identically, so there's no need to
+        # recompute (mutation_data > 0).mean(axis=0) separately).
+        mutation_counts = (mutation_data > 0).sum(axis=0)
 
-    # mutation_data = mutation_data.loc[:, mutation_data.var(axis=0) > 0]
-    if input_source in ("both", "mutation") and n_mutation_genes:
-        if mutation_selection == "frequency":
-            candidate_mask = (mutation_data > 0).sum(axis=0) >= min_mutation_count
-            candidates = mutation_data.columns[candidate_mask]
-            if len(candidates) == 0:
-                raise ValueError(f"No mutation genes have >= {min_mutation_count} mutated samples in the training split.")
-            if len(candidates) < n_mutation_genes:
+        if min_mutation_count > 0:
+            candidate_mask = mutation_counts >= min_mutation_count
+            mutation_data = mutation_data.loc[:, candidate_mask]
+            mutation_counts = mutation_counts[candidate_mask]
+            if mutation_data.shape[1] == 0:
+                raise ValueError(f"No mutation genes have >= {min_mutation_count} mutated samples.")
+
+        if not n_mutation_genes or n_mutation_genes >= mutation_data.shape[1]:
+            # Already at or below the requested cap after the floor filter -
+            # no ranking/sorting needed, just use everything that passed.
+            if n_mutation_genes and min_mutation_count > 0:
                 print(
-                    f"Only {len(candidates)} mutation genes pass min_mutation_count={min_mutation_count} "
+                    f"Only {mutation_data.shape[1]} mutation genes pass min_mutation_count={min_mutation_count} "
                     f"(requested {n_mutation_genes}); using all of them."
                 )
-                selected_mutated = candidates
-            else:
-                selected_mutated = (mutation_data > 0).mean(axis=0).sort_values(ascending=False).head(n_mutation_genes).index
-            
+            selected_mutated = mutation_data.columns
+        elif mutation_selection == "frequency":
+            selected_mutated = mutation_counts.sort_values(ascending=False).head(n_mutation_genes).index
         else:
+            # mutation_data may already be narrowed to the full-dataset
+            # min_mutation_count floor above - select_mutation_genes_univariate
+            # still rechecks it on the training split alone (see its
+            # docstring for why that's not redundant), just over fewer columns.
             train_idx, _ = train_test_split(np.arange(len(common_index)), test_size=val_split, random_state=seed)
             selected_mutated = select_mutation_genes_univariate(
                 mutation_data, expression_data, train_idx, n_mutation_genes,
@@ -305,19 +325,36 @@ def main(
     hidden_dims_subtype=(128,),
     dropout=0.3,
     weight_decay=1e-4,
-    patience=10,
     pretrain_subtype=False,
-    pretrain_epochs=200,
-    pretrain_patience=20,
+    pretrain_epochs=100,
+    pretrain_patience=10,
     l1_mutation=0.0,
     val_split=0.2,
     batch_size=128,
     lr=1e-3,
-    epochs=50,
+    epochs=100,
+    patience=10,
     seed=0,
     device=None,
     output_dir="tests",
 ):
+    # Normalize to native Python types up front, before anything downstream
+    # uses them - a caller that pulls a value back out of a pandas DataFrame
+    # (as train_and_tune.py's final retrain does when rereading a tuning
+    # grid's winning row) gets numpy scalars (numpy.int64 etc.), not plain
+    # int/float. Those behave like their native counterparts almost
+    # everywhere (arithmetic, range(), torch calls), but silently poison
+    # anything downstream of them - e.g. `final_epoch < epochs` below
+    # produces a numpy.bool_ if epochs is numpy.int64 - and neither numpy
+    # integer nor numpy bool types are JSON-serializable, unlike
+    # numpy.float64 (which subclasses float and serializes fine). Cast once,
+    # here, rather than chasing every downstream symptom individually.
+    n_mutation_genes, n_target_genes, min_mutation_count = int(n_mutation_genes), int(n_target_genes), int(min_mutation_count)
+    patience, pretrain_epochs, pretrain_patience = int(patience), int(pretrain_epochs), int(pretrain_patience)
+    batch_size, epochs, seed = int(batch_size), int(epochs), int(seed)
+    dropout, weight_decay, l1_mutation = float(dropout), float(weight_decay), float(l1_mutation)
+    val_split, lr = float(val_split), float(lr)
+
     if architecture not in ("single", "two_head"):
         raise ValueError(f"architecture must be 'single' or 'two_head', got {architecture!r}")
     if architecture == "two_head" and input_source != "both":
@@ -526,15 +563,14 @@ def parse_args():
     parser.add_argument("--hidden-dims-subtype", type=int, nargs="+", default=[128], help="two_head only: subtype branch")
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--patience", type=int, default=20, help="stop if val_loss doesn't improve for this many epochs")
     parser.add_argument(
         "--pretrain-subtype", action="store_true",
         help="two_head only: pretrain the subtype branch + shared trunk on subtype-only data first, then add the "
         "mutation branch and fine-tune - fine-tuning starts mathematically identical to the pretrained subtype-only "
         "model, so the mutation branch can only help, not disturb an already-converged subtype pathway",
     )
-    parser.add_argument("--pretrain-epochs", type=int, default=200, help="--pretrain-subtype only")
-    parser.add_argument("--pretrain-patience", type=int, default=20, help="--pretrain-subtype only")
+    parser.add_argument("--pretrain-epochs", type=int, default=100, help="--pretrain-subtype only")
+    parser.add_argument("--pretrain-patience", type=int, default=10, help="--pretrain-subtype only")
     parser.add_argument(
         "--l1-mutation", type=float, default=0.0,
         help="two_head only: group-lasso penalty strength on the mutation branch's first-layer weights (each "
@@ -544,7 +580,8 @@ def parse_args():
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=10, help="stop if val_loss doesn't improve for this many epochs")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", type=str, default="tests")
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu - default auto-detects")
@@ -566,7 +603,6 @@ if __name__ == "__main__":
         hidden_dims_subtype=args.hidden_dims_subtype,
         dropout=args.dropout,
         weight_decay=args.weight_decay,
-        patience=args.patience,
         pretrain_subtype=args.pretrain_subtype,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_patience=args.pretrain_patience,
@@ -575,6 +611,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         lr=args.lr,
         epochs=args.epochs,
+        patience=args.patience,
         seed=args.seed,
         output_dir=args.output_dir,
         device=args.device,

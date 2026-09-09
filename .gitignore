@@ -3,5 +3,6 @@ __pycache__/
 Subtype_Matrix_Public_26Q1_subsetted.csv
 Expression_(Short-read)_Public_26Q1_subsetted.csv
 Damaging_Mutations_(Public_26Q1)_subsetted.csv
+Copy_Number_WGS_Public_26Q1_(log2)_subsetted.csv
 runs/
 test.py
