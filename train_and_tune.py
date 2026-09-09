@@ -16,10 +16,10 @@ import pandas as pd
 
 import predict_gene_expression as pge
 
-N_MUTATION_GENES = 10000
+N_MUTATION_GENES = 4000
 N_TARGET_GENES = 4000
 
-TUNING_DIR = "runs/tuning"
+RUN_DIR = "tuning_test"
 SEARCH_EPOCHS = 100  # shorter budget while comparing configs
 SEARCH_PATIENCE = 10
 FINAL_EPOCHS = 200  # longer budget for the single winning config
@@ -29,16 +29,18 @@ DEFAULT_LR = 1e-3
 DEFAULT_WEIGHT_DECAY = 1e-4
 
 INPUT_SOURCE = "both"  # mutation + subtype
-MUTATION_SELECTION = "univariate"  # frequency or univariate
-MIN_MUTATION_COUNT = 10  # univariate selection only: drop genes mutated in fewer than this many training samples
+MUTATION_SELECTION = "frequency"  # frequency or univariate
+MIN_MUTATION_COUNT = 6  # univariate selection only: drop genes mutated in fewer than this many training samples
 
 # Stage 1 (primary): architecture and regularization strength.
-HIDDEN_DIMS_GRID = [(512, 256, 128), (1024, 512, 256, 128), (2048, 1024, 512, 256, 128)]
-DROPOUT_GRID = [0.0, 0.1, 0.2]
+# HIDDEN_DIMS_GRID = [(512, 256, 128), (1024, 512, 256, 128), (2048, 1024, 512, 256, 128)]
+# DROPOUT_GRID = [0.0, 0.1, 0.2]
+HIDDEN_DIMS_GRID = [(512, 256), ( 256, 128)]
+DROPOUT_GRID = [0.0, 0.1]
 
 # Stage 2 (secondary): optimizer settings, searched around stage 1's winning
 # architecture rather than crossed with the full stage 1 grid.
-LR_GRID = [1e-3, 5e-4, 1e-4]
+LR_GRID = [1e-3, 5e-4]
 WEIGHT_DECAY_GRID = [1e-4, 1e-5]
 
 
@@ -76,7 +78,8 @@ def run_trial(hidden_dims, dropout, lr, weight_decay, epochs, patience, output_d
 
 
 def main():
-    Path(TUNING_DIR).mkdir(parents=True, exist_ok=True)
+    tuning_dir = RUN_DIR + "/tuning"
+    #Path(tuning_dir).mkdir(parents=True, exist_ok=True)
     results = []
 
     # --- Stage 1: hidden_dims x dropout, lr/weight_decay held at defaults ---
@@ -88,7 +91,7 @@ def main():
     for i, (hidden_dims, dropout) in enumerate(stage1_grid, 1):
         print(f"\n[stage 1: {i}/{len(stage1_grid)}] hidden_dims={hidden_dims} dropout={dropout}")
         result = run_trial(
-            hidden_dims, dropout, DEFAULT_LR, DEFAULT_WEIGHT_DECAY, SEARCH_EPOCHS, SEARCH_PATIENCE, TUNING_DIR, stage=1
+            hidden_dims, dropout, DEFAULT_LR, DEFAULT_WEIGHT_DECAY, SEARCH_EPOCHS, SEARCH_PATIENCE, tuning_dir, stage=1
         )
         results.append(result)
         print(f"  -> val_loss={result['val_loss']:.4f}  val_r2={result['val_r2']:.4f}")
@@ -113,13 +116,13 @@ def main():
         print(f"\n[stage 2: {i}/{len(stage2_grid)}] lr={lr} weight_decay={weight_decay}")
         result = run_trial(
             stage1_best["hidden_dims"], stage1_best["dropout"], lr, weight_decay,
-            SEARCH_EPOCHS, SEARCH_PATIENCE, TUNING_DIR, stage=2,
+            SEARCH_EPOCHS, SEARCH_PATIENCE, tuning_dir, stage=2,
         )
         results.append(result)
         print(f"  -> val_loss={result['val_loss']:.4f}  val_r2={result['val_r2']:.4f}")
 
     summary = pd.DataFrame(results).sort_values("val_loss").reset_index(drop=True)
-    summary.to_csv(Path(TUNING_DIR) / "tuning_summary.csv", index=False)
+    summary.to_csv(Path("runs") / tuning_dir / "tuning_summary.csv", index=False)
     print("\n=== Leaderboard (best val_loss first) ===")
     print(summary.to_string(index=False))
 
@@ -134,7 +137,7 @@ def main():
     print(f"\nRetraining the winning config with a longer budget ({FINAL_EPOCHS} epochs, patience={FINAL_PATIENCE}) -> runs/ ...")
     final = run_trial(
         best["hidden_dims"], best["dropout"], best["lr"], best["weight_decay"],
-        FINAL_EPOCHS, FINAL_PATIENCE, "runs", stage="final",
+        FINAL_EPOCHS, FINAL_PATIENCE, RUN_DIR, stage="final",
     )
     print(f"Final run: {final['run_dir']}  val_loss={final['val_loss']:.4f}  val_r2={final['val_r2']:.4f}")
 

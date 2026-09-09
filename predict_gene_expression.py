@@ -316,7 +316,7 @@ def main(
     epochs=50,
     seed=0,
     device=None,
-    output_dir="runs",
+    output_dir="tests",
 ):
     if architecture not in ("single", "two_head"):
         raise ValueError(f"architecture must be 'single' or 'two_head', got {architecture!r}")
@@ -334,7 +334,7 @@ def main(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device == "cuda" else ""))
 
-    run_dir = Path(output_dir) / f"predict_gene_expression_{datetime.now():%Y%m%d_%H%M%S}"
+    run_dir = Path("runs") / Path(output_dir) / f"predict_gene_expression_{datetime.now():%Y%m%d_%H%M%S}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     X, Y, input_features, target_genes = load_dataset(
@@ -546,7 +546,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output-dir", type=str, default="runs")
+    parser.add_argument("--output-dir", type=str, default="tests")
     parser.add_argument("--device", type=str, default=None, help="e.g. cuda, cuda:0, cpu - default auto-detects")
     return parser.parse_args()
 
