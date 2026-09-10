@@ -132,7 +132,7 @@ def select_mutation_genes_univariate(
 def load_dataset(
     n_mutation_genes, n_target_genes, input_source="both",
     mutation_selection="frequency", min_mutation_count=10, mutation_score_agg="mean",
-    n_cn_genes=0, val_split=0.2, seed=0,
+    n_cn_genes=0, restrict_to_cn_samples=False, val_split=0.2, seed=0,
 ):
     """input_source: which input block(s) to use - see parse_input_source()
     for the accepted formats (any comma-separated combination of "mutation",
@@ -155,6 +155,14 @@ def load_dataset(
     covers far fewer cell lines than the other data sources - requiring it
     unconditionally would silently drop ~1/3 of samples for every run, even
     ones not using CN at all.
+
+    restrict_to_cn_samples intersects the sample set with CN's coverage
+    *without* adding CN as a feature - use it to run a non-CN input_source
+    on the exact same cell lines a CN-inclusive run used, so a comparison
+    between them isolates CN's actual contribution instead of being
+    confounded by CN's narrower sample coverage changing the training set
+    out from under you. Only reads CN's index column (not its ~250MB of
+    values) when "cn" isn't otherwise part of input_source.
     """
     blocks = parse_input_source(input_source)
     if mutation_selection not in ("frequency", "univariate"):
@@ -169,6 +177,9 @@ def load_dataset(
         cn_data = pd.read_csv(CN_PATH, index_col=0)
         common_index = common_index.intersection(cn_data.index)
         cn_data = cn_data.loc[common_index]
+    elif restrict_to_cn_samples:
+        cn_sample_index = pd.read_csv(CN_PATH, index_col=0, usecols=[0]).index
+        common_index = common_index.intersection(cn_sample_index)
 
     mutation_data = mutation_data.loc[common_index]
     subtype_data = subtype_data.loc[common_index]
@@ -370,6 +381,7 @@ def main(
     min_mutation_count=10,
     mutation_score_agg="mean",
     n_cn_genes=0,
+    restrict_to_cn_samples=False,
     architecture="single",
     hidden_dims=(512, 256),
     hidden_dims_mutation=(512, 256),
@@ -433,18 +445,19 @@ def main(
     X, Y, input_features, target_genes = load_dataset(
         n_mutation_genes, n_target_genes, input_source=input_source,
         mutation_selection=mutation_selection, min_mutation_count=min_mutation_count,
-        mutation_score_agg=mutation_score_agg, n_cn_genes=n_cn_genes,
+        mutation_score_agg=mutation_score_agg, n_cn_genes=n_cn_genes, restrict_to_cn_samples=restrict_to_cn_samples,
         val_split=val_split, seed=seed,
     )
     print(
         f"{X.shape[0]} samples, {X.shape[1]} input features "
-        f"({','.join(input_blocks)}, {mutation_selection}/{mutation_score_agg}), {Y.shape[1]} target genes"
+        f"({','.join(input_blocks)}, {mutation_selection}/{mutation_score_agg}"
+        f"{', CN-sample-restricted' if restrict_to_cn_samples else ''}), {Y.shape[1]} target genes"
     )
 
     config = dict(
         n_mutation_genes=n_mutation_genes, n_target_genes=n_target_genes, input_source=input_source,
         mutation_selection=mutation_selection, min_mutation_count=min_mutation_count, mutation_score_agg=mutation_score_agg,
-        n_cn_genes=n_cn_genes,
+        n_cn_genes=n_cn_genes, restrict_to_cn_samples=restrict_to_cn_samples,
         architecture=architecture, hidden_dims=list(hidden_dims),
         hidden_dims_mutation=list(hidden_dims_mutation), hidden_dims_subtype=list(hidden_dims_subtype),
         dropout=dropout, weight_decay=weight_decay, patience=patience,
@@ -622,6 +635,11 @@ def parse_args():
         help="most variable CN genes to include when 'cn' is part of --input-source; 0 to use all ~18,600",
     )
     parser.add_argument(
+        "--restrict-to-cn-samples", action="store_true",
+        help="intersect the sample set with CN's coverage without adding CN as a feature - use to run a non-CN "
+        "--input-source on the same cell lines a CN-inclusive run used, for a sample-matched comparison",
+    )
+    parser.add_argument(
         "--architecture", type=str, default="single", choices=["single", "two_head"],
         help="'single' concatenates mutation+subtype into one MLP input; 'two_head' gives each block "
         "its own tower before merging, so a large mutation block can't drown out subtype (needs --input-source both)",
@@ -666,6 +684,7 @@ if __name__ == "__main__":
         min_mutation_count=args.min_mutation_count,
         mutation_score_agg=args.mutation_score_agg,
         n_cn_genes=args.n_cn_genes,
+        restrict_to_cn_samples=args.restrict_to_cn_samples,
         architecture=args.architecture,
         hidden_dims=args.hidden_dims,
         hidden_dims_mutation=args.hidden_dims_mutation,
