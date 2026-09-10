@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pandas as pd
 
-import predict_gene_expression as pge
+import train as pge
 
 N_MUTATION_GENES = 0
 N_TARGET_GENES = 0
